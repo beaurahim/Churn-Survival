@@ -1,62 +1,51 @@
-"""Simple upload-and-visualise dashboard for account risk CSV files."""
+"""Simple upload-and-visualise Kaplan–Meier dashboard."""
 
-from io import BytesIO
+from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
-import seaborn as sns
 import streamlit as st
+from lifelines import KaplanMeierFitter
 
 
-st.set_page_config(page_title="Account Risk Dashboard", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Account Survivor Curve", page_icon="📈", layout="centered")
 
 
-def numeric_columns(frame: pd.DataFrame) -> list[str]:
-    return frame.select_dtypes(include="number").columns.tolist()
-
-
-def choose_default(options: list[str], likely_names: list[str]) -> str:
-    lowered = {name.lower(): name for name in options}
+def choose_column(columns: list[str], likely_names: list[str]) -> str:
+    lowered = {name.lower(): name for name in columns}
     for likely in likely_names:
         if likely in lowered:
             return lowered[likely]
-    return options[0]
-
-
-def normalise_risk(values: pd.Series) -> pd.Series:
-    """Return risk as a 0–1 probability, accepting either 0–1 or 0–100 input."""
-    numbers = pd.to_numeric(values, errors="coerce")
-    if numbers.dropna().empty:
-        return numbers
-    if numbers.max() > 1:
-        numbers = numbers / 100
-    return numbers.clip(0, 1)
-
-
-def risk_band(risk: pd.Series) -> pd.Series:
-    return pd.cut(
-        risk,
-        bins=[-0.001, 0.10, 0.25, 0.50, 1.0],
-        labels=["Low", "Medium", "High", "Critical"],
-        include_lowest=True,
-    ).astype(str)
-
-
-def format_money(value: float) -> str:
-    if value >= 1_000_000:
-        return f"${value / 1_000_000:.1f}M"
-    if value >= 1_000:
-        return f"${value / 1_000:.0f}K"
-    return f"${value:,.0f}"
+    return columns[0]
 
 
 def main() -> None:
-    st.title("Account Risk Dashboard")
-    st.write("Upload a CSV to see which accounts may need attention. No coding or survival-analysis knowledge is required.")
+    st.title("Account Survivor Curve")
+    st.write(
+        "Upload account history and this page will create one Kaplan–Meier chart showing "
+        "the estimated share of accounts still active over time."
+    )
 
-    uploaded = st.file_uploader("Upload your account CSV", type=["csv"])
+    with st.expander("What should be in the CSV?", expanded=True):
+        st.write("Your file needs these two columns:")
+        st.code(
+            "duration_months,churned\n"
+            "6,1\n"
+            "12,0\n"
+            "18,1\n"
+            "24,0",
+            language="text",
+        )
+        st.caption(
+            "duration_months = how many months the account was observed. "
+            "churned = 1 if it churned during that period, and 0 if it was still active "
+            "when observation ended. An account name column is optional."
+        )
+
+    uploaded = st.file_uploader("Upload your CSV", type=["csv"])
     if uploaded is None:
-        st.info("Your CSV needs one account-name column, one amount column, and one risk/probability column. Example: account_name, amount, risk_score")
+        st.info("Choose a CSV above to see the survivor curve.")
         st.stop()
 
     try:
@@ -68,65 +57,68 @@ def main() -> None:
         st.error("This CSV is empty.")
         st.stop()
 
-    number_options = numeric_columns(frame)
-    if not number_options:
-        st.error("I could not find any numeric columns for amount and risk.")
+    columns = frame.columns.tolist()
+    numeric = frame.select_dtypes(include="number").columns.tolist()
+    if not numeric:
+        st.error("I could not find numeric columns. duration_months and churned must be numbers.")
         st.stop()
 
     st.sidebar.header("Choose the columns")
-    name_options = frame.columns.tolist()
-    name_col = st.sidebar.selectbox("Account name column", name_options, index=name_options.index(choose_default(name_options, ["account_name", "account", "name", "account_id"])))
-    amount_col = st.sidebar.selectbox("Amount column", number_options, index=number_options.index(choose_default(number_options, ["amount", "arr_usd", "arr", "revenue"])))
-    risk_options = [column for column in number_options if column != amount_col] or number_options
-    risk_col = st.sidebar.selectbox("Risk/probability column", risk_options, index=risk_options.index(choose_default(risk_options, ["risk_score", "risk", "probability", "churn_probability_3m"])))
+    duration_col = st.sidebar.selectbox(
+        "Months observed", numeric, index=numeric.index(choose_column(numeric, ["duration_months", "duration", "months"])),
+    )
+    event_options = [column for column in numeric if column != duration_col] or numeric
+    churn_col = st.sidebar.selectbox(
+        "Churned? (1 = yes, 0 = still active)",
+        event_options,
+        index=event_options.index(choose_column(event_options, ["churned", "event", "churn"])),
+    )
 
-    amount = pd.to_numeric(frame[amount_col], errors="coerce")
-    risk = normalise_risk(frame[risk_col])
-    clean = pd.DataFrame({"Account": frame[name_col].astype(str), "Amount": amount, "Risk probability": risk}).dropna()
-    if clean.empty:
-        st.error("The selected amount and risk columns do not contain usable numeric values.")
+    duration = pd.to_numeric(frame[duration_col], errors="coerce")
+    churned = pd.to_numeric(frame[churn_col], errors="coerce")
+    clean = pd.DataFrame({"duration_months": duration, "churned": churned}).dropna()
+    clean = clean[clean["duration_months"] > 0]
+    if not clean["churned"].isin([0, 1]).all():
+        st.error("The churned column must contain only 0 (still active) or 1 (churned).")
         st.stop()
-    clean["Risk band"] = risk_band(clean["Risk probability"])
-    clean = clean.sort_values("Risk probability", ascending=False)
+    if clean.empty:
+        st.error("There are no usable rows. Check duration_months and churned.")
+        st.stop()
 
-    critical = clean["Risk band"].isin(["High", "Critical"])
-    cards = st.columns(4)
-    cards[0].metric("Accounts", f"{len(clean):,}")
-    cards[1].metric("Total amount", format_money(clean["Amount"].sum()))
-    cards[2].metric("Average risk", f"{clean['Risk probability'].mean():.1%}")
-    cards[3].metric("High/Critical accounts", f"{critical.sum():,}")
+    kmf = KaplanMeierFitter()
+    kmf.fit(clean["duration_months"], event_observed=clean["churned"], label="All accounts")
 
-    st.subheader("Risk overview")
-    left, right = st.columns(2)
-    order = ["Low", "Medium", "High", "Critical"]
-    counts = clean["Risk band"].value_counts().reindex(order, fill_value=0)
-    with left:
-        fig, ax = plt.subplots(figsize=(7, 4))
-        sns.barplot(x=counts.index, y=counts.values, hue=counts.index, palette=["#4c956c", "#e9c46a", "#f4a261", "#e76f51"], legend=False, ax=ax)
-        ax.set(xlabel="Risk band", ylabel="Number of accounts", title="Accounts by risk band")
-        ax.grid(axis="y", alpha=0.25)
-        sns.despine(ax=ax)
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
-    with right:
-        fig, ax = plt.subplots(figsize=(7, 4))
-        sns.scatterplot(data=clean, x="Risk probability", y="Amount", hue="Risk band", hue_order=order, palette={"Low": "#4c956c", "Medium": "#e9c46a", "High": "#f4a261", "Critical": "#e76f51"}, s=70, ax=ax)
-        ax.set(xlabel="Churn/risk probability", ylabel="Amount", title="Amount at risk")
-        ax.xaxis.set_major_formatter(lambda value, _: f"{value:.0%}")
-        ax.yaxis.set_major_formatter(lambda value, _: format_money(value))
-        ax.grid(alpha=0.2)
-        sns.despine(ax=ax)
-        st.pyplot(fig, use_container_width=True)
-        plt.close(fig)
+    st.subheader("Estimated account survivorship")
+    st.caption(
+        "The curve shows the estimated probability that an account remains active beyond each month. "
+        "The shaded area is the uncertainty range."
+    )
+    fig, ax = plt.subplots(figsize=(10, 6))
+    kmf.plot_survival_function(ax=ax, ci_show=True, color="#1769aa")
+    ax.axhline(0.5, color="#b04a4a", linestyle="--", linewidth=1, label="50% survival")
+    median = kmf.median_survival_time_
+    if np.isfinite(median):
+        ax.axvline(median, color="#b04a4a", linestyle=":", linewidth=1)
+        median_text = f"Estimated median survival: {median:.1f} months"
+    else:
+        median_text = "Median survival was not reached during observation"
+    ax.set_title(f"Kaplan–Meier Survivor Curve\n{median_text}")
+    ax.set_xlabel("Months since observation began")
+    ax.set_ylabel("Probability account remains active")
+    ax.set_ylim(0, 1.05)
+    ax.set_yticks(np.linspace(0, 1, 6))
+    ax.yaxis.set_major_formatter(lambda value, _: f"{value:.0%}")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
 
-    st.subheader("Accounts needing attention")
-    st.caption("Sorted from highest risk to lowest risk. Risk bands use Low <10%, Medium 10–25%, High 25–50%, Critical ≥50%.")
-    st.dataframe(clean.style.format({"Amount": "${:,.0f}", "Risk probability": "{:.1%}"}), use_container_width=True, hide_index=True)
-
-    download = BytesIO()
-    clean.to_csv(download, index=False)
-    st.download_button("Download this cleaned risk list", data=download.getvalue(), file_name="account_risk_summary.csv", mime="text/csv")
+    st.caption(
+        f"Based on {len(clean):,} accounts and {int(clean['churned'].sum()):,} observed churn events."
+    )
 
 
 if __name__ == "__main__":
     main()
+
